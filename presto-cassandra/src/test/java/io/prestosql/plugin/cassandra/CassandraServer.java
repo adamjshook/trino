@@ -14,6 +14,7 @@
 package io.prestosql.plugin.cassandra;
 
 import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.ProtocolVersion;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import com.google.common.collect.ImmutableList;
@@ -56,29 +57,37 @@ public class CassandraServer
 
     private final GenericContainer<?> dockerContainer;
     private final CassandraSession session;
+    private final Cluster cluster;
 
     public CassandraServer()
             throws Exception
     {
+        this("cassandra:2.1.16", V3);
+    }
+
+    public CassandraServer(String dockerImageName, ProtocolVersion version)
+            throws Exception
+    {
         log.info("Starting cassandra...");
 
-        this.dockerContainer = new GenericContainer<>("cassandra:2.1.16")
+        this.dockerContainer = new GenericContainer<>(dockerImageName)
                 .withExposedPorts(PORT)
                 .withCopyFileToContainer(forHostPath(prepareCassandraYaml()), "/etc/cassandra/cassandra.yaml");
         this.dockerContainer.start();
 
         Cluster.Builder clusterBuilder = Cluster.builder()
-                .withProtocolVersion(V3)
+                .withProtocolVersion(version)
                 .withClusterName("TestCluster")
                 .addContactPointsWithPorts(ImmutableList.of(
                         new InetSocketAddress(this.dockerContainer.getContainerIpAddress(), this.dockerContainer.getMappedPort(PORT))))
                 .withMaxSchemaAgreementWaitSeconds(30);
 
-        ReopeningCluster cluster = new ReopeningCluster(clusterBuilder::build);
+        this.cluster = new ReopeningCluster(clusterBuilder::build);
         CassandraSession session = new CassandraSession(
                 JsonCodec.listJsonCodec(ExtraColumnMetadata.class),
                 cluster,
-                new Duration(1, MINUTES));
+                new Duration(1, MINUTES),
+                false);
 
         try {
             checkConnectivity(session);
@@ -109,6 +118,10 @@ public class CassandraServer
         write(modified, yamlLocation.toFile(), UTF_8);
 
         return yamlLocation.toAbsolutePath().toString();
+    }
+
+    public Cluster getCluster() {
+        return cluster;
     }
 
     public CassandraSession getSession()

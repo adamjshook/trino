@@ -16,6 +16,7 @@ package io.prestosql.plugin.cassandra;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.airlift.json.JsonCodec;
+import io.airlift.log.Logger;
 import io.airlift.slice.Slice;
 import io.prestosql.spi.PrestoException;
 import io.prestosql.spi.connector.ColumnHandle;
@@ -43,6 +44,7 @@ import io.prestosql.spi.type.Type;
 import javax.inject.Inject;
 
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -67,6 +69,8 @@ public class CassandraMetadata
         implements ConnectorMetadata
 {
     public static final String PRESTO_COMMENT_METADATA = "Presto Metadata:";
+
+    private static final Logger LOG = Logger.get(CassandraMetadata.class);
 
     private final CassandraSession cassandraSession;
     private final CassandraPartitionManager partitionManager;
@@ -205,14 +209,18 @@ public class CassandraMetadata
     @Override
     public Optional<ConstraintApplicationResult<ConnectorTableHandle>> applyFilter(ConnectorSession session, ConnectorTableHandle tableHandle, Constraint constraint)
     {
+        long start = System.currentTimeMillis();
+        LOG.info("applyFilter %s", constraint.getSummary().toString(session));
         CassandraTableHandle handle = (CassandraTableHandle) tableHandle;
 
         CassandraPartitionResult partitionResult = partitionManager.getPartitions(handle, constraint.getSummary());
+        LOG.info("applyFilter - getPartitions %s", System.currentTimeMillis() - start);
 
         String clusteringKeyPredicates = "";
         TupleDomain<ColumnHandle> unenforcedConstraint;
         if (partitionResult.isUnpartitioned()) {
             unenforcedConstraint = partitionResult.getUnenforcedConstraint();
+            LOG.info("applyFilter - isUnpartitioned - unenforcedConstraint %s", System.currentTimeMillis() - start);
         }
         else {
             CassandraClusteringPredicatesExtractor clusteringPredicatesExtractor = new CassandraClusteringPredicatesExtractor(
@@ -220,17 +228,28 @@ public class CassandraMetadata
                     partitionResult.getUnenforcedConstraint(),
                     cassandraSession.getCassandraVersion());
             clusteringKeyPredicates = clusteringPredicatesExtractor.getClusteringKeyPredicates();
+            LOG.info("applyFilter - partitioned - clusteringKeyPredicates %s", System.currentTimeMillis() - start);
             unenforcedConstraint = clusteringPredicatesExtractor.getUnenforcedConstraints();
+            LOG.info("applyFilter - partitioned - unenforcedConstraint %s", System.currentTimeMillis() - start);
         }
 
+        // TODO How expensive is this? -- Very expensive
         Optional<List<CassandraPartition>> currentPartitions = handle.getPartitions();
+        LOG.info("applyFilter currentPartitionsPresent %s currentPartitionsSize %s partitionResultSize %s handle.clusteringKeyPredicatesLength %s clusteringKeyPredicatesLength %s",
+                currentPartitions.isPresent(),
+                currentPartitions.orElse(ImmutableList.of()).size(),
+                partitionResult.getPartitions().size(),
+                handle.getClusteringKeyPredicates().length(),
+                clusteringKeyPredicates.length());
         if (currentPartitions.isPresent() &&
                 // TODO: we should skip only when new table handle does not narrow down enforced predicate
-                currentPartitions.get().containsAll(partitionResult.getPartitions()) &&
+                new HashSet<>(currentPartitions.get()).containsAll(new HashSet<>(partitionResult.getPartitions())) &&
                 handle.getClusteringKeyPredicates().equals(clusteringKeyPredicates)) {
+            LOG.info("applyFilter - isEmpty %s", System.currentTimeMillis() - start);
             return Optional.empty();
         }
 
+        LOG.info("applyFilter - constrained %s", System.currentTimeMillis() - start);
         return Optional.of(
                 new ConstraintApplicationResult<>(new CassandraTableHandle(
                         handle.getSchemaName(),

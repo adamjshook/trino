@@ -20,6 +20,7 @@ import com.datastax.driver.core.DataType;
 import com.datastax.driver.core.Host;
 import com.datastax.driver.core.IndexMetadata;
 import com.datastax.driver.core.KeyspaceMetadata;
+import com.datastax.driver.core.LocalDate;
 import com.datastax.driver.core.MaterializedViewMetadata;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ProtocolVersion;
@@ -30,6 +31,7 @@ import com.datastax.driver.core.Session;
 import com.datastax.driver.core.Statement;
 import com.datastax.driver.core.TableMetadata;
 import com.datastax.driver.core.TokenRange;
+import com.datastax.driver.core.TypeCodec;
 import com.datastax.driver.core.VersionNumber;
 import com.datastax.driver.core.exceptions.NoHostAvailableException;
 import com.datastax.driver.core.policies.ReconnectionPolicy;
@@ -37,12 +39,17 @@ import com.datastax.driver.core.policies.ReconnectionPolicy.ReconnectionSchedule
 import com.datastax.driver.core.querybuilder.Clause;
 import com.datastax.driver.core.querybuilder.QueryBuilder;
 import com.datastax.driver.core.querybuilder.Select;
+import com.google.common.base.MoreObjects;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Ordering;
 import com.google.common.collect.Sets;
 import io.airlift.json.JsonCodec;
 import io.airlift.log.Logger;
+import io.airlift.slice.Slice;
 import io.airlift.units.Duration;
 import io.prestosql.plugin.cassandra.util.CassandraCqlUtils;
 import io.prestosql.spi.PrestoException;
@@ -53,19 +60,25 @@ import io.prestosql.spi.connector.TableNotFoundException;
 import io.prestosql.spi.predicate.NullableValue;
 import io.prestosql.spi.predicate.TupleDomain;
 
+import javax.annotation.Nonnull;
+
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import static com.datastax.driver.core.querybuilder.QueryBuilder.eq;
 import static com.datastax.driver.core.querybuilder.QueryBuilder.select;
+import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Suppliers.memoize;
 import static com.google.common.collect.ImmutableList.toImmutableList;
@@ -78,6 +91,7 @@ import static io.prestosql.plugin.cassandra.CassandraType.toCassandraType;
 import static io.prestosql.plugin.cassandra.util.CassandraCqlUtils.selectDistinctFrom;
 import static io.prestosql.plugin.cassandra.util.CassandraCqlUtils.validSchemaName;
 import static io.prestosql.spi.StandardErrorCode.NOT_SUPPORTED;
+import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
 import static java.util.Comparator.comparing;
 import static java.util.Locale.ENGLISH;
@@ -97,13 +111,27 @@ public class CassandraSession
     private final Cluster cluster;
     private final Supplier<Session> session;
     private final Duration noHostAvailableRetryTimeout;
+    private final boolean skipPartitionCheck;
+    private final LoadingCache<PartitionBuilderKey, List<CassandraPartition>> partitionBuilderCache;
 
-    public CassandraSession(JsonCodec<List<ExtraColumnMetadata>> extraColumnMetadataCodec, Cluster cluster, Duration noHostAvailableRetryTimeout)
+    public CassandraSession(JsonCodec<List<ExtraColumnMetadata>> extraColumnMetadataCodec, Cluster cluster, Duration noHostAvailableRetryTimeout, boolean skipPartitionCheck)
     {
         this.extraColumnMetadataCodec = requireNonNull(extraColumnMetadataCodec, "extraColumnMetadataCodec is null");
         this.cluster = requireNonNull(cluster, "cluster is null");
         this.noHostAvailableRetryTimeout = requireNonNull(noHostAvailableRetryTimeout, "noHostAvailableRetryTimeout is null");
+        this.skipPartitionCheck = skipPartitionCheck;
         this.session = memoize(cluster::connect);
+        this.partitionBuilderCache = CacheBuilder.newBuilder()
+                .expireAfterAccess(5, TimeUnit.MINUTES)
+                .build(new CacheLoader<>()
+                {
+                    @Override
+                    public List<CassandraPartition> load(@Nonnull PartitionBuilderKey key)
+                    {
+                        log.info("LOADING FROM CACHE");
+                        return buildPartitionsFromFilterPrefixes(key.protocolVersion, key.cassandraTable, key.filterPrefixes);
+                    }
+                });
     }
 
     public VersionNumber getCassandraVersion()
@@ -349,6 +377,51 @@ public class CassandraSession
         return Optional.of(new CassandraColumnHandle(columnMeta.getName(), ordinalPosition, cassandraType.get(), partitionKey, clusteringKey, indexed, hidden));
     }
 
+    private static class PartitionBuilderKey
+    {
+        ProtocolVersion protocolVersion;
+        CassandraTable cassandraTable;
+        List<Set<Object>> filterPrefixes;
+
+        public PartitionBuilderKey(ProtocolVersion protocolVersion, CassandraTable cassandraTable, List<Set<Object>> filterPrefixes)
+        {
+            this.protocolVersion = protocolVersion;
+            this.cassandraTable = cassandraTable;
+            this.filterPrefixes = filterPrefixes;
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            PartitionBuilderKey that = (PartitionBuilderKey) o;
+            return protocolVersion == that.protocolVersion &&
+                    Objects.equals(cassandraTable, that.cassandraTable) &&
+                    Objects.equals(filterPrefixes, that.filterPrefixes);
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hash(protocolVersion, cassandraTable, filterPrefixes);
+        }
+
+        @Override
+        public String toString()
+        {
+            return toStringHelper(this)
+                    .add("protocolVersion", protocolVersion)
+                    .add("cassandraTable", cassandraTable)
+                    .add("filterPrefixes", filterPrefixes)
+                    .toString();
+        }
+    }
+
     /**
      * Get the list of partitions matching the given filters on partition keys.
      *
@@ -359,6 +432,17 @@ public class CassandraSession
      */
     public List<CassandraPartition> getPartitions(CassandraTable table, List<Set<Object>> filterPrefixes)
     {
+        if (skipPartitionCheck) {
+            try {
+                PartitionBuilderKey key = new PartitionBuilderKey(getProtocolVersion(), table, filterPrefixes);
+                log.info("CALLING GET FOR CACHE %s %s", key.hashCode(), key);
+                return partitionBuilderCache.get(key);
+            }
+            catch (ExecutionException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
         List<CassandraColumnHandle> partitionKeyColumns = table.getPartitionKeyColumns();
 
         if (filterPrefixes.size() != partitionKeyColumns.size()) {
@@ -475,6 +559,104 @@ public class CassandraSession
         }
 
         return rowList.build();
+    }
+
+    private static List<CassandraPartition> buildPartitionsFromFilterPrefixes(ProtocolVersion protocolVersion, CassandraTable table, List<Set<Object>> filterPrefixes)
+    {
+        List<CassandraColumnHandle> partitionKeyColumns = table.getPartitionKeyColumns();
+
+        if (filterPrefixes.size() != partitionKeyColumns.size()) {
+            return ImmutableList.of(CassandraPartition.UNPARTITIONED);
+        }
+
+        ByteBuffer buffer = ByteBuffer.allocate(1000);
+        HashMap<ColumnHandle, NullableValue> map = new HashMap<>();
+        Set<String> uniquePartitionIds = new HashSet<>();
+        StringBuilder stringBuilder = new StringBuilder();
+
+        boolean isComposite = partitionKeyColumns.size() > 1;
+
+        ImmutableList.Builder<CassandraPartition> partitions = ImmutableList.builder();
+        for (List<Object> values : Sets.cartesianProduct(filterPrefixes)) {
+            buffer.clear();
+            map.clear();
+            stringBuilder.setLength(0);
+            for (int i = 0; i < partitionKeyColumns.size(); i++) {
+                Object value = values.get(i);
+                CassandraColumnHandle columnHandle = partitionKeyColumns.get(i);
+                CassandraType cassandraType = columnHandle.getCassandraType();
+
+                switch (cassandraType) {
+                    case ASCII:
+                    case TEXT:
+                    case VARCHAR:
+                        Slice slice = (Slice) value;
+                        if (isComposite) {
+                            buffer.putShort((short) slice.length());
+                            buffer.put(slice.getBytes());
+                            buffer.put((byte) 0);
+                        }
+                        else {
+                            buffer.put(slice.getBytes());
+                        }
+                        break;
+                    case INT:
+                        // Date is number of epoch days
+                        int intValue = toIntExact((long) value);
+                        if (isComposite) {
+                            buffer.putShort((short) Integer.BYTES);
+                            buffer.putInt(intValue);
+                            buffer.put((byte) 0);
+                        }
+                        else {
+                            buffer.putInt(intValue);
+                        }
+                        break;
+                    case BIGINT:
+                        if (isComposite) {
+                            buffer.putShort((short) Long.BYTES);
+                            buffer.putLong((long) value);
+                            buffer.put((byte) 0);
+                        }
+                        else {
+                            buffer.putLong((long) value);
+                        }
+                        break;
+                    case DATE:
+                        // Date is number of epoch days
+                        int numDays = toIntExact((long) value);
+                        ByteBuffer dateBytes = TypeCodec.date().serialize(LocalDate.fromDaysSinceEpoch(numDays), protocolVersion);
+                        if (isComposite) {
+                            buffer.putShort((short) Integer.BYTES);
+                            buffer.put(dateBytes);
+                            buffer.put((byte) 0);
+                        }
+                        else {
+                            buffer.put(dateBytes);
+                        }
+                        break;
+                    default:
+                        throw new IllegalStateException("Handling of type " + cassandraType + " is not implemented");
+                }
+
+                map.put(columnHandle, NullableValue.of(cassandraType.getPrestoType(), value));
+                if (i > 0) {
+                    stringBuilder.append(" AND ");
+                }
+                stringBuilder.append(CassandraCqlUtils.validColumnName(columnHandle.getName()));
+                stringBuilder.append(" = ");
+                stringBuilder.append(cassandraType.toCqlLiteral(value));
+            }
+            buffer.flip();
+            byte[] key = new byte[buffer.limit()];
+            buffer.get(key);
+            TupleDomain<ColumnHandle> tupleDomain = TupleDomain.fromFixedValues(map);
+            String partitionId = stringBuilder.toString();
+            if (uniquePartitionIds.add(partitionId)) {
+                partitions.add(new CassandraPartition(key, partitionId, tupleDomain, false));
+            }
+        }
+        return partitions.build();
     }
 
     private static void addWhereInClauses(Select.Where where, List<CassandraColumnHandle> partitionKeyColumns, List<Set<Object>> filterPrefixes)

@@ -77,6 +77,7 @@ public class CassandraClientConfig
     private String keystorePassword;
     private File truststorePath;
     private String truststorePassword;
+    private boolean skipPartitionCheckEnabled;
 
     @NotNull
     @Size(min = 1)
@@ -463,6 +464,19 @@ public class CassandraClientConfig
     public CassandraClientConfig setTruststorePassword(String truststorePassword)
     {
         this.truststorePassword = truststorePassword;
+        return this;
+    }
+
+    // This would be better off as a session property
+    public boolean isSkipPartitionCheckEnabled()
+    {
+        return skipPartitionCheckEnabled;
+    }
+
+    @Config("cassandra.skip-partition-check-enabled")
+    public CassandraClientConfig setSkipPartitionCheckEnabled(boolean skipPartitionCheckEnabled)
+    {
+        this.skipPartitionCheckEnabled = skipPartitionCheckEnabled;
         return this;
     }
 }

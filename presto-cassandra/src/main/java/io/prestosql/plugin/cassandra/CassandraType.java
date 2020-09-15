@@ -327,8 +327,9 @@ public enum CassandraType
             case ASCII:
             case TEXT:
             case VARCHAR:
-            case DATE:
                 return quoteStringLiteral(value);
+            case DATE:
+                return quoteStringLiteral(LocalDate.fromDaysSinceEpoch(((Long) prestoNativeValue).intValue()).toString());
             case INET:
                 // remove '/' in the string. e.g. /127.0.0.1
                 return quoteStringLiteral(value.substring(1));
