@@ -29,7 +29,12 @@ public class RedisServer
 
     public RedisServer()
     {
-        container = new GenericContainer<>("redis:2.8.9")
+        this("2.8.9");
+    }
+
+    public RedisServer(String redisVersion)
+    {
+        container = new GenericContainer<>("redis:" + redisVersion)
                 .withExposedPorts(PORT);
         container.start();
 

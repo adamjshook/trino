@@ -19,14 +19,14 @@ import io.trino.testing.QueryRunner;
 
 import static io.trino.plugin.redis.RedisQueryRunner.createRedisQueryRunner;
 
-public class TestRedisConnectorTest
+public class TestRedisConnectorTestLatest
         extends BaseRedisConnectorTest
 {
     @Override
     protected QueryRunner createQueryRunner()
             throws Exception
     {
-        RedisServer redisServer = closeAfterClass(new RedisServer());
+        RedisServer redisServer = closeAfterClass(new RedisServer("6.2.0"));
         return createRedisQueryRunner(redisServer, ImmutableMap.of(), "string", REQUIRED_TPCH_TABLES);
     }
 }
