@@ -11,7 +11,8 @@ broken down into cells by using table definition files.
 Only Redis string and hash value types are supported; sets and zsets cannot be
 queried from Trino.
 
-The connector requires Redis 2.8.0 or later.
+The connector is tested against Redis 2.8.x and 6.2.x, but any intermediate or
+newer versions are expected to work.
 
 Configuration
 -------------
